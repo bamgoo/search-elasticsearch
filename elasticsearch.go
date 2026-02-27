@@ -61,8 +61,23 @@ func (d *elasticDriver) Connect(inst *search.Instance) (search.Connection, error
 
 func (c *elasticConnection) Open() error  { return nil }
 func (c *elasticConnection) Close() error { return nil }
+func (c *elasticConnection) Capabilities() search.Capabilities {
+	return search.Capabilities{
+		SyncIndex: true,
+		Clear:     true,
+		Upsert:    true,
+		Delete:    true,
+		Search:    true,
+		Count:     true,
+		Suggest:   false,
+		Sort:      true,
+		Facets:    true,
+		Highlight: true,
+		FilterOps: []string{OpEq, OpNe, OpIn, OpNin, OpGt, OpGte, OpLt, OpLte, OpRange},
+	}
+}
 
-func (c *elasticConnection) CreateIndex(name string, index search.Index) error {
+func (c *elasticConnection) SyncIndex(name string, index search.Index) error {
 	idx := c.indexName(name)
 	payload := Map{}
 	if index.Setting != nil {
@@ -90,25 +105,30 @@ func (c *elasticConnection) CreateIndex(name string, index search.Index) error {
 	return err
 }
 
-func (c *elasticConnection) DropIndex(name string) error {
-	_, err := c.request(http.MethodDelete, "/"+url.PathEscape(c.indexName(name)), nil)
+func (c *elasticConnection) Clear(name string) error {
+	body := Map{"query": Map{"match_all": Map{}}}
+	_, err := c.request(http.MethodPost, "/"+url.PathEscape(c.indexName(name))+"/_delete_by_query", body)
 	return err
 }
 
-func (c *elasticConnection) Upsert(index string, docs []search.Document) error {
-	if len(docs) == 0 {
+func (c *elasticConnection) Upsert(index string, rows []Map) error {
+	if len(rows) == 0 {
 		return nil
 	}
 	idx := c.indexName(index)
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
-	for _, doc := range docs {
-		if doc.ID == "" {
+	for _, row := range rows {
+		if row == nil {
 			continue
 		}
-		action := Map{"index": Map{"_index": idx, "_id": doc.ID}}
+		id := fmt.Sprintf("%v", row["id"])
+		if id == "" || id == "<nil>" {
+			continue
+		}
+		action := Map{"index": Map{"_index": idx, "_id": id}}
 		_ = enc.Encode(action)
-		_ = enc.Encode(doc.Payload)
+		_ = enc.Encode(row)
 	}
 	return c.bulk(buf.Bytes())
 }
@@ -205,29 +225,6 @@ func (c *elasticConnection) Count(index string, query search.Query) (int64, erro
 	return resp.Count, nil
 }
 
-func (c *elasticConnection) Suggest(index string, text string, limit int) ([]string, error) {
-	if limit <= 0 {
-		limit = 10
-	}
-	res, err := c.Search(index, search.Query{Keyword: strings.TrimSpace(text), Offset: 0, Limit: limit})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]string, 0, len(res.Hits))
-	seen := map[string]struct{}{}
-	for _, hit := range res.Hits {
-		if hit.ID == "" {
-			continue
-		}
-		if _, ok := seen[hit.ID]; ok {
-			continue
-		}
-		seen[hit.ID] = struct{}{}
-		out = append(out, hit.ID)
-	}
-	return out, nil
-}
-
 func (c *elasticConnection) bulk(body []byte) error {
 	req, err := http.NewRequest(http.MethodPost, c.server+"/_bulk", bytes.NewReader(body))
 	if err != nil {
@@ -294,7 +291,11 @@ func (c *elasticConnection) indexName(name string) string {
 func buildSearchBody(query search.Query) Map {
 	must := make([]Any, 0)
 	if strings.TrimSpace(query.Keyword) != "" {
-		must = append(must, Map{"multi_match": Map{"query": query.Keyword, "fields": []string{"*"}}})
+		if query.Prefix {
+			must = append(must, Map{"query_string": Map{"query": query.Keyword + "*", "analyze_wildcard": true}})
+		} else {
+			must = append(must, Map{"multi_match": Map{"query": query.Keyword, "fields": []string{"*"}}})
+		}
 	}
 	filters := make([]Any, 0)
 	for _, f := range query.Filters {
@@ -352,29 +353,29 @@ func buildSearchBody(query search.Query) Map {
 func toFilterQuery(f search.Filter) Map {
 	op := strings.ToLower(strings.TrimSpace(f.Op))
 	if op == "" {
-		op = "eq"
+		op = search.FilterEq
 	}
 	switch op {
-	case "eq", "=":
+	case search.FilterEq, "=":
 		return Map{"term": Map{f.Field: f.Value}}
-	case "in":
+	case search.FilterIn:
 		vals := f.Values
 		if len(vals) == 0 && f.Value != nil {
 			vals = []Any{f.Value}
 		}
 		return Map{"terms": Map{f.Field: vals}}
-	case "gt", ">", "gte", ">=", "lt", "<", "lte", "<=", "range":
+	case search.FilterGt, ">", search.FilterGte, ">=", search.FilterLt, "<", search.FilterLte, "<=", search.FilterRange:
 		r := Map{}
 		switch op {
-		case "gt", ">":
+		case search.FilterGt, ">":
 			r["gt"] = f.Value
-		case "gte", ">=":
+		case search.FilterGte, ">=":
 			r["gte"] = f.Value
-		case "lt", "<":
+		case search.FilterLt, "<":
 			r["lt"] = f.Value
-		case "lte", "<=":
+		case search.FilterLte, "<=":
 			r["lte"] = f.Value
-		case "range":
+		case search.FilterRange:
 			if f.Min != nil {
 				r["gte"] = f.Min
 			}
